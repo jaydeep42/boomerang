@@ -26,6 +26,7 @@ import android.content.Context;
 import android.content.DialogInterface;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
+import android.graphics.Bitmap;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Point;
@@ -44,11 +45,18 @@ import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Bundle;
+import android.os.Environment;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.support.annotation.NonNull;
+import android.support.annotation.Nullable;
 import android.support.v13.app.FragmentCompat;
 import android.support.v4.content.ContextCompat;
+import android.support.v8.renderscript.Allocation;
+import android.support.v8.renderscript.Element;
+import android.support.v8.renderscript.RenderScript;
+import android.support.v8.renderscript.Script;
+import android.support.v8.renderscript.Type;
 import android.util.Log;
 import android.util.Size;
 import android.util.SparseIntArray;
@@ -58,6 +66,9 @@ import android.view.TextureView;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.Toast;
+
+import org.jcodec.api.SequenceEncoder;
+import org.jcodec.common.model.Picture;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -71,15 +82,15 @@ import java.util.List;
 import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
+import static org.jcodec.common.model.ColorSpace.RGB;
+
 public class Camera2BasicFragment extends Fragment
         implements View.OnClickListener, FragmentCompat.OnRequestPermissionsResultCallback {
 
-    /**
-     * Conversion from screen rotation to JPEG orientation.
-     */
     private static final SparseIntArray ORIENTATIONS = new SparseIntArray();
     private static final int REQUEST_CAMERA_PERMISSION = 1;
     private static final String FRAGMENT_DIALOG = "dialog";
+    public static final int TOTAL_FRAMES = 15;
 
     static {
         ORIENTATIONS.append(Surface.ROTATION_0, 90);
@@ -88,50 +99,17 @@ public class Camera2BasicFragment extends Fragment
         ORIENTATIONS.append(Surface.ROTATION_270, 180);
     }
 
-    /**
-     * Tag for the {@link Log}.
-     */
+    private static RenderScript rs;
+
     private static final String TAG = "Camera2BasicFragment";
-
-    /**
-     * Camera state: Showing camera preview.
-     */
     private static final int STATE_PREVIEW = 0;
-
-    /**
-     * Camera state: Waiting for the focus to be locked.
-     */
     private static final int STATE_WAITING_LOCK = 1;
-
-    /**
-     * Camera state: Waiting for the exposure to be precapture state.
-     */
     private static final int STATE_WAITING_PRECAPTURE = 2;
-
-    /**
-     * Camera state: Waiting for the exposure state to be something other than precapture.
-     */
     private static final int STATE_WAITING_NON_PRECAPTURE = 3;
-
-    /**
-     * Camera state: Picture was taken.
-     */
     private static final int STATE_PICTURE_TAKEN = 4;
-
-    /**
-     * Max preview width that is guaranteed by Camera2 API
-     */
     private static final int MAX_PREVIEW_WIDTH = 1920;
-
-    /**
-     * Max preview height that is guaranteed by Camera2 API
-     */
     private static final int MAX_PREVIEW_HEIGHT = 1080;
 
-    /**
-     * {@link TextureView.SurfaceTextureListener} handles several lifecycle events on a
-     * {@link TextureView}.
-     */
     private final TextureView.SurfaceTextureListener mSurfaceTextureListener
             = new TextureView.SurfaceTextureListener() {
 
@@ -156,34 +134,11 @@ public class Camera2BasicFragment extends Fragment
 
     };
 
-    /**
-     * ID of the current {@link CameraDevice}.
-     */
     private String mCameraId;
-
-    /**
-     * An {@link AutoFitTextureView} for camera preview.
-     */
     private AutoFitTextureView mTextureView;
-
-    /**
-     * A {@link CameraCaptureSession } for camera preview.
-     */
     private CameraCaptureSession mCaptureSession;
-
-    /**
-     * A reference to the opened {@link CameraDevice}.
-     */
     private CameraDevice mCameraDevice;
-
-    /**
-     * The {@link android.util.Size} of camera preview.
-     */
     private Size mPreviewSize;
-
-    /**
-     * {@link CameraDevice.StateCallback} is called when {@link CameraDevice} changes its state.
-     */
     private final CameraDevice.StateCallback mStateCallback = new CameraDevice.StateCallback() {
 
         @Override
@@ -213,76 +168,110 @@ public class Camera2BasicFragment extends Fragment
         }
 
     };
-
-    /**
-     * An additional thread for running tasks that shouldn't block the UI.
-     */
     private HandlerThread mBackgroundThread;
-
-    /**
-     * A {@link Handler} for running tasks in the background.
-     */
     private Handler mBackgroundHandler;
-
-    /**
-     * An {@link ImageReader} that handles still image capture.
-     */
     private ImageReader mImageReader;
 
-    /**
-     * This is the output file for our picture.
-     */
-    private File mFile;
+    ArrayList<Bitmap> images = new ArrayList<>();
 
-    /**
-     * This a callback object for the {@link ImageReader}. "onImageAvailable" will be called when a
-     * still image is ready to be saved.
-     */
     private final ImageReader.OnImageAvailableListener mOnImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
 
         @Override
         public void onImageAvailable(ImageReader reader) {
-            mBackgroundHandler.post(new ImageSaver(reader.acquireNextImage(), mFile));
+            final Image image = reader.acquireNextImage();
+
+            Bitmap bitmap = YUV_420_888_toRGB(image, image.getWidth(), image.getHeight());
+            images.add(bitmap);
+            image.close();
         }
 
     };
 
-    /**
-     * {@link CaptureRequest.Builder} for the camera preview
-     */
+    private void buildVideo() throws Exception {
+        final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
+
+        if (!f.exists()) {
+            boolean rv = f.mkdir();
+            Log.d(TAG, "Folder creation " + (rv ? "success" : "failed"));
+        }
+
+        File file = new File(f.getAbsolutePath() + "/mov" + System.currentTimeMillis() + ".mp4");
+        SequenceEncoder sequenceEncoder = new SequenceEncoder(file);
+
+        Log.d(TAG, "Starting to build mp4");
+
+        for (int i = 0; i < TOTAL_FRAMES; i++) {
+            sequenceEncoder.encodeNativeFrame(fromBitmap(images.get(i)));
+        }
+
+        for (int i = TOTAL_FRAMES - 1; i >= 0; i--) {
+            sequenceEncoder.encodeNativeFrame(fromBitmap(images.get(i)));
+        }
+
+        sequenceEncoder.finish();
+        Log.d(TAG, "write to mp4 complete");
+
+
+        /*
+        File file = new File(f.getAbsolutePath() + "/gif" + System.currentTimeMillis() + ".gif");
+        AnimatedGIFWriter writer = new AnimatedGIFWriter(true);
+        OutputStream os = new FileOutputStream(file);
+
+        writer.prepareForWrite(os, -1, -1);
+
+        for (int i = 0; i < TOTAL_FRAMES; i++) {
+            Log.d(TAG, "Writing frame " + i);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            images.get(i).compress(Bitmap.CompressFormat.PNG, 100, out);
+            Bitmap decoded = BitmapFactory.decodeStream(new ByteArrayInputStream(out.toByteArray()));
+
+            writer.writeFrame(os, decoded);
+            Log.d(TAG, "Frame written");
+        }
+
+        for (int i = TOTAL_FRAMES - 1; i >= 0; i--) {
+            Log.d(TAG, "Writing frame " + i);
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            images.get(i).compress(Bitmap.CompressFormat.PNG, 100, out);
+            Bitmap decoded = BitmapFactory.decodeStream(new ByteArrayInputStream(out.toByteArray()));
+
+            writer.writeFrame(os, decoded);
+            Log.d(TAG, "Frame written");
+        }
+
+        Log.d(TAG, "Writing over");
+        writer.finishWrite(os);*/
+    }
+
+    public static Picture fromBitmap(Bitmap src) {
+        Picture dst = Picture.create((int)src.getWidth(), (int)src.getHeight(), RGB);
+        fromBitmap(src, dst);
+        return dst;
+    }
+
+    public static void fromBitmap(Bitmap src, Picture dst) {
+        int[] dstData = dst.getPlaneData(0);
+        int[] packed = new int[src.getWidth() * src.getHeight()];
+
+        src.getPixels(packed, 0, src.getWidth(), 0, 0, src.getWidth(), src.getHeight());
+
+        for (int i = 0, srcOff = 0, dstOff = 0; i < src.getHeight(); i++) {
+            for (int j = 0; j < src.getWidth(); j++, srcOff++, dstOff += 3) {
+                int rgb = packed[srcOff];
+                dstData[dstOff]     = (rgb >> 16) & 0xff;
+                dstData[dstOff + 1] = (rgb >> 8) & 0xff;
+                dstData[dstOff + 2] = rgb & 0xff;
+            }
+        }
+    }
+
     private CaptureRequest.Builder mPreviewRequestBuilder;
-
-    /**
-     * {@link CaptureRequest} generated by {@link #mPreviewRequestBuilder}
-     */
     private CaptureRequest mPreviewRequest;
-
-    /**
-     * The current state of camera state for taking pictures.
-     *
-     * @see #mCaptureCallback
-     */
     private int mState = STATE_PREVIEW;
-
-    /**
-     * A {@link Semaphore} to prevent the app from exiting before closing the camera.
-     */
     private Semaphore mCameraOpenCloseLock = new Semaphore(1);
-
-    /**
-     * Whether the current camera device supports Flash or not.
-     */
     private boolean mFlashSupported;
-
-    /**
-     * Orientation of the camera sensor
-     */
     private int mSensorOrientation;
-
-    /**
-     * A {@link CameraCaptureSession.CaptureCallback} that handles events related to JPEG capture.
-     */
     private CameraCaptureSession.CaptureCallback mCaptureCallback
             = new CameraCaptureSession.CaptureCallback() {
 
@@ -348,11 +337,6 @@ public class Camera2BasicFragment extends Fragment
 
     };
 
-    /**
-     * Shows a {@link Toast} on the UI thread.
-     *
-     * @param text The message to show
-     */
     private void showToast(final String text) {
         final Activity activity = getActivity();
         if (activity != null) {
@@ -382,7 +366,7 @@ public class Camera2BasicFragment extends Fragment
      * @return The optimal {@code Size}, or an arbitrary one if none were big enough
      */
     private static Size chooseOptimalSize(Size[] choices, int textureViewWidth,
-            int textureViewHeight, int maxWidth, int maxHeight, Size aspectRatio) {
+                                          int textureViewHeight, int maxWidth, int maxHeight, Size aspectRatio) {
 
         // Collect the supported resolutions that are at least as big as the preview Surface
         List<Size> bigEnough = new ArrayList<>();
@@ -394,7 +378,7 @@ public class Camera2BasicFragment extends Fragment
             if (option.getWidth() <= maxWidth && option.getHeight() <= maxHeight &&
                     option.getHeight() == option.getWidth() * h / w) {
                 if (option.getWidth() >= textureViewWidth &&
-                    option.getHeight() >= textureViewHeight) {
+                        option.getHeight() >= textureViewHeight) {
                     bigEnough.add(option);
                 } else {
                     notBigEnough.add(option);
@@ -434,7 +418,12 @@ public class Camera2BasicFragment extends Fragment
     @Override
     public void onActivityCreated(Bundle savedInstanceState) {
         super.onActivityCreated(savedInstanceState);
-        mFile = new File(getActivity().getExternalFilesDir(null), "pic.jpg");
+        rs = RenderScript.create(getActivity());
+    }
+
+    @Override
+    public void onCreate(@Nullable Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
     }
 
     @Override
@@ -464,7 +453,7 @@ public class Camera2BasicFragment extends Fragment
         if (FragmentCompat.shouldShowRequestPermissionRationale(this, Manifest.permission.CAMERA)) {
             new ConfirmationDialog().show(getChildFragmentManager(), FRAGMENT_DIALOG);
         } else {
-            FragmentCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA},
+            FragmentCompat.requestPermissions(this, new String[]{Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE},
                     REQUEST_CAMERA_PERMISSION);
         }
     }
@@ -513,7 +502,7 @@ public class Camera2BasicFragment extends Fragment
                         Arrays.asList(map.getOutputSizes(ImageFormat.JPEG)),
                         new CompareSizesByArea());
                 mImageReader = ImageReader.newInstance(largest.getWidth(), largest.getHeight(),
-                        ImageFormat.JPEG, /*maxImages*/2);
+                        ImageFormat.YUV_420_888, 2);
                 mImageReader.setOnImageAvailableListener(
                         mOnImageAvailableListener, mBackgroundHandler);
 
@@ -810,43 +799,61 @@ public class Camera2BasicFragment extends Fragment
      */
     private void captureStillPicture() {
         try {
-            final Activity activity = getActivity();
-            if (null == activity || null == mCameraDevice) {
-                return;
+            List<CaptureRequest> captureList = new ArrayList<CaptureRequest>();
+            mPreviewRequestBuilder.set(CaptureRequest.EDGE_MODE,
+                    CaptureRequest.EDGE_MODE_OFF);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON);
+            mPreviewRequestBuilder.set(
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE,
+                    CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_OFF);
+            mPreviewRequestBuilder.set(CaptureRequest.NOISE_REDUCTION_MODE,
+                    CaptureRequest.NOISE_REDUCTION_MODE_OFF);
+            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AF_TRIGGER,
+                    CaptureRequest.CONTROL_AF_TRIGGER_CANCEL);
+
+            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AE_LOCK, true);
+            mPreviewRequestBuilder.set(CaptureRequest.CONTROL_AWB_LOCK, true);
+
+            int rotation = getActivity().getWindowManager().getDefaultDisplay().getRotation();
+            Log.d(TAG, "rotation " + rotation);
+            mPreviewRequestBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation));
+            mPreviewRequestBuilder.addTarget(mImageReader.getSurface());
+
+            for (int i = 0; i < TOTAL_FRAMES; i++) {
+                captureList.add(mPreviewRequestBuilder.build());
             }
-            // This is the CaptureRequest.Builder that we use to take a picture.
-            final CaptureRequest.Builder captureBuilder =
-                    mCameraDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
-            captureBuilder.addTarget(mImageReader.getSurface());
-
-            // Use the same AE and AF modes as the preview.
-            captureBuilder.set(CaptureRequest.CONTROL_AF_MODE,
-                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            setAutoFlash(captureBuilder);
-
-            // Orientation
-            int rotation = activity.getWindowManager().getDefaultDisplay().getRotation();
-            captureBuilder.set(CaptureRequest.JPEG_ORIENTATION, getOrientation(rotation));
-
-            CameraCaptureSession.CaptureCallback CaptureCallback
-                    = new CameraCaptureSession.CaptureCallback() {
-
-                @Override
-                public void onCaptureCompleted(@NonNull CameraCaptureSession session,
-                                               @NonNull CaptureRequest request,
-                                               @NonNull TotalCaptureResult result) {
-                    showToast("Saved: " + mFile);
-                    Log.d(TAG, mFile.toString());
-                    unlockFocus();
-                }
-            };
 
             mCaptureSession.stopRepeating();
-            mCaptureSession.capture(captureBuilder.build(), CaptureCallback, null);
+            mCaptureSession.captureBurst(captureList, cameraCaptureCallback, null);
+            mPreviewRequestBuilder.removeTarget(mImageReader.getSurface());
         } catch (CameraAccessException e) {
             e.printStackTrace();
         }
     }
+
+    private int mPictureCounter = 0;
+    CameraCaptureSession.CaptureCallback cameraCaptureCallback = new CameraCaptureSession.CaptureCallback() {
+        @Override
+        public void onCaptureCompleted(CameraCaptureSession session, CaptureRequest request,
+                                       TotalCaptureResult result) {
+            Log.d("camera", "saved");
+            mPictureCounter++;
+            if (mPictureCounter >= TOTAL_FRAMES) {
+                unlockFocus();
+                mPictureCounter = 0;
+                try {
+                    buildVideo();
+                } catch (IOException e) {
+                    e.printStackTrace();
+                } catch (Exception e) {
+                    e.printStackTrace();
+                }
+                Log.d(TAG, "size : " + images.size());
+            }
+        }
+    };
 
     /**
      * Retrieves the JPEG orientation from the specified screen rotation.
@@ -924,34 +931,116 @@ public class Camera2BasicFragment extends Fragment
          */
         private final File mFile;
 
-        public ImageSaver(Image image, File file) {
+        public ImageSaver(Image image) {
             mImage = image;
-            mFile = file;
+            mFile = createNewImageFile();
         }
 
         @Override
         public void run() {
-            ByteBuffer buffer = mImage.getPlanes()[0].getBuffer();
-            byte[] bytes = new byte[buffer.remaining()];
-            buffer.get(bytes);
-            FileOutputStream output = null;
+            Bitmap bitmap = YUV_420_888_toRGB(mImage, mImage.getWidth(), mImage.getHeight());
+
             try {
-                output = new FileOutputStream(mFile);
-                output.write(bytes);
-            } catch (IOException e) {
+                FileOutputStream out = new FileOutputStream(mFile);
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out);
+                out.flush();
+                out.close();
+
+                fileMaps.add(mFile.getAbsolutePath());
+            } catch (Exception e) {
                 e.printStackTrace();
             } finally {
                 mImage.close();
-                if (null != output) {
-                    try {
-                        output.close();
-                    } catch (IOException e) {
-                        e.printStackTrace();
-                    }
-                }
             }
         }
 
+        private File createNewImageFile() {
+            final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
+
+            if (!f.exists()) {
+                boolean rv = f.mkdir();
+                Log.d(TAG, "Folder creation " + (rv ? "success" : "failed"));
+            }
+
+            File file = new File(f.getAbsolutePath() + "/pic" + System.currentTimeMillis() + ".jpg");
+
+            return file;
+        }
+
+    }
+
+    private static ArrayList<String> fileMaps = new ArrayList<>();
+
+    public static Bitmap YUV_420_888_toRGB(Image image, int width, int height) {
+        // Get the three image planes
+        Image.Plane[] planes = image.getPlanes();
+        ByteBuffer buffer = planes[0].getBuffer();
+        byte[] y = new byte[buffer.remaining()];
+        buffer.get(y);
+
+        buffer = planes[1].getBuffer();
+        byte[] u = new byte[buffer.remaining()];
+        buffer.get(u);
+
+        buffer = planes[2].getBuffer();
+        byte[] v = new byte[buffer.remaining()];
+        buffer.get(v);
+
+        // get the relevant RowStrides and PixelStrides
+        // (we know from documentation that PixelStride is 1 for y)
+        int yRowStride = planes[0].getRowStride();
+        int uvRowStride = planes[1].getRowStride();  // we know from   documentation that RowStride is the same for u and v.
+        int uvPixelStride = planes[1].getPixelStride();  // we know from   documentation that PixelStride is the same for u and v.
+
+
+        // rs creation just for demo. Create rs just once in onCreate and use it again.
+        //RenderScript rs = MainActivity.rs;
+        ScriptC_yuvtorgb mYuv420 = new ScriptC_yuvtorgb(rs);
+
+        // Y,U,V are defined as global allocations, the out-Allocation is the Bitmap.
+        // Note also that uAlloc and vAlloc are 1-dimensional while yAlloc is 2-dimensional.
+        Type.Builder typeUcharY = new Type.Builder(rs, Element.U8(rs));
+        typeUcharY.setX(yRowStride).setY(height);
+        Allocation yAlloc = Allocation.createTyped(rs, typeUcharY.create());
+        yAlloc.copyFrom(y);
+        mYuv420.set_ypsIn(yAlloc);
+
+        Type.Builder typeUcharUV = new Type.Builder(rs, Element.U8(rs));
+        // note that the size of the u's and v's are as follows:
+        //      (  (width/2)*PixelStride + padding  ) * (height/2)
+        // =    (RowStride                          ) * (height/2)
+        // but I noted that on the S7 it is 1 less...
+        typeUcharUV.setX(u.length);
+        Allocation uAlloc = Allocation.createTyped(rs, typeUcharUV.create());
+        uAlloc.copyFrom(u);
+        mYuv420.set_uIn(uAlloc);
+
+        Allocation vAlloc = Allocation.createTyped(rs, typeUcharUV.create());
+        vAlloc.copyFrom(v);
+        mYuv420.set_vIn(vAlloc);
+
+        // handover parameters
+        mYuv420.set_picWidth(width);
+        mYuv420.set_uvRowStride(uvRowStride);
+        mYuv420.set_uvPixelStride(uvPixelStride);
+
+        Bitmap outBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Allocation outAlloc = Allocation.createFromBitmap(rs, outBitmap, Allocation.MipmapControl.MIPMAP_NONE, Allocation.USAGE_SCRIPT);
+
+        Script.LaunchOptions lo = new Script.LaunchOptions();
+        lo.setX(0, width);  // by this we ignore the y’s padding zone, i.e. the right side of x between width and yRowStride
+        lo.setY(0, height);
+
+        mYuv420.forEach_doConvert(outAlloc, lo);
+        outAlloc.copyTo(outBitmap);
+
+        return rotateBitmap(outBitmap, 90);
+    }
+
+    public static Bitmap rotateBitmap(Bitmap source, float angle) {
+        Matrix matrix = new Matrix();
+        matrix.postRotate(angle);
+        return Bitmap.createBitmap(source, 0, 0, source.getWidth(), source.getHeight(), matrix, true);
     }
 
     /**
@@ -1013,7 +1102,7 @@ public class Camera2BasicFragment extends Fragment
                         @Override
                         public void onClick(DialogInterface dialog, int which) {
                             FragmentCompat.requestPermissions(parent,
-                                    new String[]{Manifest.permission.CAMERA},
+                                    new String[]{Manifest.permission.CAMERA, Manifest.permission.WRITE_EXTERNAL_STORAGE},
                                     REQUEST_CAMERA_PERMISSION);
                         }
                     })
