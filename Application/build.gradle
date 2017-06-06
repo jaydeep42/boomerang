@@ -47,11 +47,11 @@ android {
         renderscriptTargetApi 18
         renderscriptSupportModeEnabled true
 
-        externalNativeBuild {
+/*        externalNativeBuild {
             cmake {
                 cppFlags ""
             }
-        }
+        }*/
     }
 
     /*externalNativeBuild {

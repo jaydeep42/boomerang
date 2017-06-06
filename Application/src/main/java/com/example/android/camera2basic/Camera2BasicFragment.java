@@ -27,6 +27,7 @@ import android.content.DialogInterface;
 import android.content.pm.PackageManager;
 import android.content.res.Configuration;
 import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.ImageFormat;
 import android.graphics.Matrix;
 import android.graphics.Point;
@@ -172,7 +173,7 @@ public class Camera2BasicFragment extends Fragment
     private Handler mBackgroundHandler;
     private ImageReader mImageReader;
 
-    ArrayList<Bitmap> images = new ArrayList<>();
+    ArrayList<String> images = new ArrayList<>();
 
     private final ImageReader.OnImageAvailableListener mOnImageAvailableListener
             = new ImageReader.OnImageAvailableListener() {
@@ -182,14 +183,81 @@ public class Camera2BasicFragment extends Fragment
             final Image image = reader.acquireNextImage();
 
             Bitmap bitmap = YUV_420_888_toRGB(image, image.getWidth(), image.getHeight());
-            images.add(bitmap);
-            image.close();
+
+            File file = createNewImageFile();
+            try {
+                FileOutputStream out = new FileOutputStream(file);
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out);
+                out.flush();
+                out.close();
+
+                images.add(file.getAbsolutePath());
+            } catch (Exception e) {
+                e.printStackTrace();
+            } finally {
+                image.close();
+            }
         }
 
     };
 
     private void buildVideo() throws Exception {
-        final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
+
+        Thread thread = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
+
+                if (!f.exists()) {
+                    boolean rv = f.mkdir();
+                    Log.d(TAG, "Folder creation " + (rv ? "success" : "failed"));
+                }
+
+                File file = new File(f.getAbsolutePath() + "/mov" + System.currentTimeMillis() + ".mp4");
+                SequenceEncoder sequenceEncoder = null;
+                try {
+                    sequenceEncoder = new SequenceEncoder(file);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+
+                Log.d(TAG, "Starting to build mp4");
+
+                for (int i = 0; i < images.size(); i++) {
+                    try {
+                        Bitmap bitmap = BitmapFactory.decodeFile(images.get(i));
+                        sequenceEncoder.encodeNativeFrame(fromBitmap(bitmap));
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                for (int i = images.size() - 1; i >= 0; i--) {
+                    try {
+                        Bitmap bitmap = BitmapFactory.decodeFile(images.get(i));
+                        sequenceEncoder.encodeNativeFrame(fromBitmap(bitmap));
+                    } catch (IOException e) {
+                        e.printStackTrace();
+                    }
+                }
+
+                try {
+                    sequenceEncoder.finish();
+
+                    for (String s : images) {
+                        new File(s).delete();
+                    }
+
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
+                Log.d(TAG, "write to mp4 complete");
+            }
+        });
+
+        thread.start();
+
+        /*final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
 
         if (!f.exists()) {
             boolean rv = f.mkdir();
@@ -210,7 +278,7 @@ public class Camera2BasicFragment extends Fragment
         }
 
         sequenceEncoder.finish();
-        Log.d(TAG, "write to mp4 complete");
+        Log.d(TAG, "write to mp4 complete");*/
 
 
         /*
@@ -845,6 +913,7 @@ public class Camera2BasicFragment extends Fragment
                 mPictureCounter = 0;
                 try {
                     buildVideo();
+                    createCameraPreviewSession();
                 } catch (IOException e) {
                     e.printStackTrace();
                 } catch (Exception e) {
@@ -967,6 +1036,19 @@ public class Camera2BasicFragment extends Fragment
             return file;
         }
 
+    }
+
+    private File createNewImageFile() {
+        final File f = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "boom");
+
+        if (!f.exists()) {
+            boolean rv = f.mkdir();
+            Log.d(TAG, "Folder creation " + (rv ? "success" : "failed"));
+        }
+
+        File file = new File(f.getAbsolutePath() + "/pic" + System.currentTimeMillis() + ".jpg");
+
+        return file;
     }
 
     private static ArrayList<String> fileMaps = new ArrayList<>();
